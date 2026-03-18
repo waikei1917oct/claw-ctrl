@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import threading
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -59,7 +61,7 @@ def _load_agents(repo) -> list:
     try:
         agent_names = repo.list_agents() if repo else []
         agents_dir = Path.home() / ".openclaw" / "agents"
-        workspace_dir = Path.home() / ".openclaw" / "workspace"
+        main_workspace = Path.home() / ".openclaw" / "workspace"
         agents = []
         for name in agent_names:
             agent_path = agents_dir / name
@@ -93,21 +95,24 @@ def _load_agents(repo) -> list:
                     pass
             agent_data["auth_profiles"] = auth_profiles
 
-            # Persona files — in ~/.openclaw/workspace/ (uppercase)
+            # Workspace — read per-agent path from openclaw.json; fall back to main workspace
+            try:
+                agent_workspace = repo.get_agent_workspace(name) if repo else main_workspace
+            except Exception:
+                agent_workspace = main_workspace
+            agent_data["workspace"] = str(agent_workspace)
+
+            # Persona files — read from the agent's own workspace
             persona_files = {}
             for md_name in ("AGENTS.md", "HEARTBEAT.md", "IDENTITY.md", "MEMORY.md", "SOUL.md", "TOOLS.md", "USER.md"):
-                # per-agent workspace subdir takes priority, fallback to shared workspace
-                per_agent = workspace_dir / name / md_name
-                shared = workspace_dir / md_name
-                if per_agent.exists():
-                    persona_files[md_name] = str(per_agent)
-                elif shared.exists():
-                    persona_files[md_name] = str(shared)
+                p = agent_workspace / md_name
+                if p.exists():
+                    persona_files[md_name] = str(p)
             agent_data["persona_files"] = persona_files
 
-            # Channels — from global openclaw.json
+            # Channel bindings — only bindings assigned to this specific agent
             try:
-                agent_data["channels"] = repo.list_channels() if repo else []
+                agent_data["channels"] = repo.get_agent_channel_bindings(name) if repo else []
             except Exception:
                 agent_data["channels"] = []
 
@@ -170,11 +175,24 @@ class ModelSelectScreen(Screen):
             selected = self._models[idx]
             try:
                 self._repo.set_agent_model(self._agent_name, selected)
-                self.notify(f"Model updated to: {selected}", severity="information")
-                self.notify("Restart openclaw to apply changes.", severity="warning")
             except Exception as e:
                 self.notify(f"Error: {e}", severity="error")
+                self.app.pop_screen()
+                return
             self.app.pop_screen()
+            self.notify(f"Model set to: {selected}. Validating + restarting openclaw ...", severity="information")
+            def _worker() -> None:
+                try:
+                    v = subprocess.run(["openclaw", "config", "validate"], capture_output=True, text=True)
+                    if v.returncode != 0:
+                        msg = (v.stderr or v.stdout).strip().splitlines()[-1] if (v.stderr or v.stdout).strip() else "validate failed"
+                        self.app.call_from_thread(self.notify, f"validate error: {msg}", severity="error")
+                        return
+                    subprocess.run(["openclaw", "gateway", "restart"], capture_output=True, text=True)
+                    self.app.call_from_thread(self.notify, "openclaw restarted with new model.", severity="information")
+                except Exception as exc:
+                    self.app.call_from_thread(self.notify, f"Error: {exc}", severity="error")
+            threading.Thread(target=_worker, daemon=True).start()
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -303,6 +321,119 @@ class NewAgentScreen(Screen):
 
 
 # ---------------------------------------------------------------------------
+# Agent Profile Switch Screen
+# ---------------------------------------------------------------------------
+
+def _profile_to_openclaw_params(profile) -> dict:
+    """Map a ModelRunProfile to openclaw params dict."""
+    return {
+        "temperature": profile.temp,
+        "maxTokens": profile.max_tokens,
+        "topP": profile.top_p,
+        "topK": profile.top_k,
+        "minP": profile.min_p,
+        "repeatPenalty": profile.repeat_penalty,
+        "contextSize": profile.context_size,
+    }
+
+
+def _model_key_to_run_config(model_key: str):
+    """
+    Given an openclaw model key like 'llamaLocal/model.gguf', extract the
+    model filename and look it up in ModelRunConfigRepo.
+    Returns None if no config found (including for non-llama.cpp models).
+    """
+    if "/" not in model_key:
+        return None
+    model_name = model_key.split("/", 1)[1]
+    try:
+        from infrastructure.llm.model_run_config_repo import ModelRunConfigRepo
+        repo = ModelRunConfigRepo()
+        # Try exact match, with/without .gguf
+        return (
+            repo.get(model_name)
+            or repo.get(model_name + ".gguf")
+            or repo.get(model_name[:-5] if model_name.lower().endswith(".gguf") else model_name)
+        )
+    except Exception:
+        return None
+
+
+class AgentProfileSwitchScreen(Screen):
+    """Choose a llama.cpp run profile and apply its params to the agent."""
+
+    BINDINGS = [Binding("q", "pop_screen", "Cancel")]
+
+    def __init__(self, agent_name: str, model_key: str, repo) -> None:
+        super().__init__()
+        self._agent_name = agent_name
+        self._model_key = model_key
+        self._repo = repo
+        self._profiles: list[tuple[str, object]] = []
+        cfg = _model_key_to_run_config(model_key)
+        if cfg:
+            self._profiles = list(cfg.profiles.items())
+        self._current_params = {}
+        try:
+            self._current_params = repo.get_agent_model_params(agent_name)
+        except Exception:
+            pass
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Footer()
+        with Vertical():
+            yield Static(
+                f"[bold cyan]Switch Profile — {self._agent_name}[/bold cyan]",
+                classes="section-title",
+            )
+            yield Static(f"Model: {self._model_key}", classes="info-line")
+            if self._current_params:
+                params_str = "  ".join(f"{k}={v}" for k, v in self._current_params.items())
+                yield Static(f"Current overrides: {params_str}", classes="info-line-dim")
+            else:
+                yield Static("Current overrides: (none — using defaults)", classes="info-line-dim")
+            yield Static("", classes="spacer")
+            if self._profiles:
+                yield Static("Select a profile to apply to this agent:", classes="info-line")
+                items = [
+                    ListItem(Label(
+                        f"{name}  [dim]temp={p.temp}  ctx={p.context_size}  "
+                        f"ngl={p.gpu_layers}  maxTok={p.max_tokens}[/dim]"
+                    ))
+                    for name, p in self._profiles
+                ]
+                yield ListView(*items, id="agent-profile-list")
+            else:
+                yield Static(
+                    "[yellow]No profiles found for this model.[/yellow]\n"
+                    "Create profiles in LLM Management first.",
+                    classes="info-line",
+                )
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is None or idx >= len(self._profiles):
+            return
+        profile_name, profile = self._profiles[idx]
+        params = _profile_to_openclaw_params(profile)
+        try:
+            self._repo.set_agent_model_params(self._agent_name, self._model_key, params)
+            self.notify(
+                f"Profile '{profile_name}' applied to {self._agent_name} "
+                f"(written to defaults.models[{self._model_key}]). "
+                "Restart openclaw to take effect.",
+                severity="information",
+            )
+            self.app.pop_screen()
+        except Exception as e:
+            self.notify(f"Error: {e}", severity="error")
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
+
+
+# ---------------------------------------------------------------------------
 # Agent Detail Screen
 # ---------------------------------------------------------------------------
 
@@ -311,19 +442,32 @@ class AgentDetailScreen(Screen):
         Binding("q", "pop_screen", "Back"),
         Binding("m", "change_model", "Change Model"),
         Binding("a", "auth_profiles", "Auth Profiles"),
+        Binding("p", "switch_profile", "Switch Profile"),
+        Binding("x", "delete_agent", "Delete Agent"),
     ]
 
-    def __init__(self, agent_data: dict) -> None:
+    def __init__(self, agent_data: dict, repo) -> None:
         super().__init__()
         self._agent = agent_data
+        self._repo = repo
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Footer()
         a = self._agent
+        # Detect stale agent (dir exists but not in openclaw.json)
+        in_config = bool(a.get("workspace"))  # workspace is only set for agents in JSON
+        stale = not in_config or (
+            a.get("workspace") == str(Path.home() / ".openclaw" / "workspace")
+            and a["name"] != "main"
+        )
         with ScrollableContainer():
-            yield Static(f"[bold cyan]Agent: {a['name']}[/bold cyan]", classes="section-title")
-            yield Static(f"Path: {a['path']}", classes="info-line")
+            title = f"[bold cyan]Agent: {a['name']}[/bold cyan]"
+            if not in_config:
+                title += "  [yellow](stale — not in openclaw.json)[/yellow]"
+            yield Static(title, classes="section-title")
+            yield Static(f"Agent Dir: {a['path']}", classes="info-line")
+            yield Static(f"Workspace: {a.get('workspace', 'N/A')}", classes="info-line")
             yield Static(f"Default Model: {a.get('default_model', 'N/A')}", classes="info-line")
             yield Static(f"Current Model: {a.get('current_model') or 'N/A'}", classes="info-line")
 
@@ -340,22 +484,28 @@ class AgentDetailScreen(Screen):
             else:
                 yield Static("  No persona files found", classes="info-line-dim")
 
-            # Channels section
+            # Channel bindings section — per-agent only
             yield Static("", classes="spacer")
-            yield Static("[bold]Channels[/bold]", classes="section-title")
+            yield Static("[bold]Channel Bindings[/bold]", classes="section-title")
             channels = a.get("channels", [])
             if channels:
                 for ch in channels:
-                    enabled = "[green]enabled[/green]" if ch.get("enabled") else "[red]disabled[/red]"
-                    yield Static(f"  • {ch['name']} ({enabled}) — {ch.get('account_count', 0)} account(s): {', '.join(ch.get('accounts', []))}", classes="info-line")
+                    channel = ch.get("channel", "")
+                    account = ch.get("accountId", "")
+                    match = ch.get("match", {})
+                    extra = {k: v for k, v in match.items() if k not in ("channel", "accountId")}
+                    extra_str = f"  [{', '.join(f'{k}={v}' for k, v in extra.items())}]" if extra else ""
+                    yield Static(f"  • {channel} / {account}{extra_str}", classes="info-line")
             else:
-                yield Static("  No channels configured", classes="info-line-dim")
+                yield Static("  No channel bindings for this agent", classes="info-line-dim")
 
             # Actions
             yield Static("", classes="spacer")
             with Horizontal(classes="actions-bar"):
                 yield Button("Change Model (m)", id="btn_change_model", variant="primary")
                 yield Button("Auth Profiles (a)", id="btn_auth_profiles", variant="warning")
+                yield Button("Switch Profile (p)", id="btn_switch_profile", variant="success")
+                yield Button("Delete Agent (x)", id="btn_delete_agent", variant="error")
                 yield Button("Back (q)", id="btn_back", variant="default")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -373,6 +523,10 @@ class AgentDetailScreen(Screen):
             ))
         elif bid == "btn_auth_profiles":
             self.app.push_screen(AuthProfileScreen(self._agent["name"]))
+        elif bid == "btn_switch_profile":
+            self.action_switch_profile()
+        elif bid == "btn_delete_agent":
+            self.action_delete_agent()
 
     def action_change_model(self) -> None:
         from infrastructure.openclaw.config_repo import OpenClawConfigRepo
@@ -386,6 +540,39 @@ class AgentDetailScreen(Screen):
 
     def action_auth_profiles(self) -> None:
         self.app.push_screen(AuthProfileScreen(self._agent["name"]))
+
+    def action_switch_profile(self) -> None:
+        current_model = self._agent.get("current_model")
+        if not current_model:
+            self.notify("No model set for this agent", severity="warning")
+            return
+        if _model_key_to_run_config(current_model) is None:
+            self.notify(
+                "No run profiles found for this model's framework",
+                severity="warning",
+            )
+            return
+        if self._repo:
+            self.app.push_screen(
+                AgentProfileSwitchScreen(self._agent["name"], current_model, self._repo)
+            )
+        else:
+            self.notify("Repository not available", severity="error")
+
+    def action_delete_agent(self) -> None:
+        name = self._agent["name"]
+        if self._repo:
+            try:
+                self._repo.delete_agent(name)
+                self.notify(
+                    f"Agent '{name}' removed. Files kept. Restart openclaw to apply.",
+                    severity="information",
+                )
+                self.app.pop_screen()
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+        else:
+            self.notify("No repo available", severity="error")
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -401,7 +588,6 @@ class OpenClawScreen(Screen):
         Binding("t", "stop_openclaw", "Stop"),
         Binding("r", "restart_openclaw", "Restart"),
         Binding("n", "new_agent", "New Agent"),
-        Binding("x", "delete_agent", "Delete Agent"),
         Binding("q", "pop_screen", "Back"),
     ]
 
@@ -426,7 +612,6 @@ class OpenClawScreen(Screen):
             yield Button("Stop (t)", id="btn_oc_stop", variant="error")
             yield Button("Restart (r)", id="btn_oc_restart", variant="warning")
             yield Button("New Agent (n)", id="btn_oc_new_agent", variant="primary")
-            yield Button("Delete Agent (x)", id="btn_oc_del_agent", variant="error")
             yield Button("Back (q)", id="btn_oc_back", variant="default")
 
     def on_mount(self) -> None:
@@ -487,10 +672,14 @@ class OpenClawScreen(Screen):
             for agent in self._agents:
                 lv.append(ListItem(Label(agent["name"])))
 
+    def on_screen_resume(self) -> None:
+        """Refresh agent list when returning from AgentDetailScreen (e.g. after deletion)."""
+        self._live_refresh()
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         idx = event.list_view.index
         if idx is not None and 0 <= idx < len(self._agents):
-            self.app.push_screen(AgentDetailScreen(self._agents[idx]))
+            self.app.push_screen(AgentDetailScreen(self._agents[idx], self._repo))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
@@ -502,8 +691,6 @@ class OpenClawScreen(Screen):
             self.action_restart_openclaw()
         elif bid == "btn_oc_new_agent":
             self.action_new_agent()
-        elif bid == "btn_oc_del_agent":
-            self.action_delete_agent()
         elif bid == "btn_oc_back":
             self.app.pop_screen()
 
@@ -553,22 +740,6 @@ class OpenClawScreen(Screen):
         models = self._repo.list_available_models()
         self.app.push_screen(NewAgentScreen(models, self._repo))
 
-    def action_delete_agent(self) -> None:
-        lv = self.query_one("#agents-list", ListView)
-        idx = lv.index
-        if idx is None or not self._agents or idx >= len(self._agents):
-            self.notify("No agent selected", severity="warning")
-            return
-        agent = self._agents[idx]
-        name = agent["name"]
-        if self._repo:
-            try:
-                self._repo.delete_agent(name)
-                self.notify(f"Agent '{name}' removed from config. Files kept. Restart openclaw to apply.", severity="information")
-                self._live_refresh()
-            except Exception as e:
-                self.notify(f"Error: {e}", severity="error")
-
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
@@ -581,7 +752,12 @@ class FrameworkDetailScreen(Screen):
     BINDINGS = [
         Binding("p", "pull_model", "Pull"),
         Binding("d", "delete_model", "Delete"),
+        Binding("e", "edit_run_profile", "Profiles"),
+        Binding("f", "set_default", "Set Default"),
+        Binding("o", "add_to_openclaw", "Add to OpenClaw"),
+        Binding("r", "remove_from_openclaw", "Remove from OpenClaw"),
         Binding("c", "change_port", "Change Port"),
+        Binding("l", "set_model_dir", "Model Dir"),
         Binding("q", "pop_screen", "Back"),
     ]
 
@@ -589,26 +765,49 @@ class FrameworkDetailScreen(Screen):
         super().__init__()
         self._hub = hub
         self._framework_name = framework_name
-        self._input_mode: str | None = None  # "pull", "port"
+        # "pull" | "port" | "model_dir" | "move_confirm" | "purge_confirm"
+        self._input_mode: str | None = None
+        self._pending_model_dir: str | None = None
+        self._pending_purge_dir: str | None = None
+        self._busy = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Footer()
         with Vertical(id="fw-detail-layout"):
             yield Static("", id="fw-detail-info", classes="panel")
+            yield Static("", id="fw-progress", classes="hidden")
             yield Static("[bold]Available Models[/bold]", classes="section-title")
             yield DataTable(id="models-table")
             yield Input(placeholder="Enter value...", id="fw-input", classes="hidden")
         with Horizontal(id="fw-actions", classes="actions-bar"):
-            yield Button("Pull Model (p)", id="btn_pull", variant="primary")
-            yield Button("Delete Model (d)", id="btn_delete", variant="error")
-            yield Button("Change Port (c)", id="btn_port", variant="warning")
+            yield Button("Pull (p)", id="btn_pull", variant="primary")
+            yield Button("Delete (d)", id="btn_delete", variant="error")
+            yield Button("Profiles (e)", id="btn_run_profile", variant="success")
+            yield Button("Default (f)", id="btn_set_default", variant="warning")
+            yield Button("Add OC (o)", id="btn_openclaw", variant="primary")
+            yield Button("Rm OC (r)", id="btn_remove_openclaw", variant="error")
+            yield Button("Port (c)", id="btn_port", variant="warning")
+            yield Button("Dir (l)", id="btn_model_dir", variant="success")
             yield Button("Back (q)", id="btn_fw_back", variant="default")
 
     def on_mount(self) -> None:
         table = self.query_one("#models-table", DataTable)
-        table.add_columns("Name", "Size", "Framework")
+        table.add_columns("Name", "Size", "Framework", "Run Profile")
         self._refresh()
+
+    def on_screen_resume(self) -> None:
+        self._refresh()
+
+    def _get_live_storage_dir(self) -> str | None:
+        """Return where the framework is currently storing models (live probe)."""
+        try:
+            if self._hub:
+                live = self._hub.get_live_storage_dir(self._framework_name)
+                return str(live) if live else None
+        except Exception:
+            pass
+        return None
 
     def _refresh(self) -> None:
         if self._hub is None:
@@ -622,6 +821,38 @@ class FrameworkDetailScreen(Screen):
         status_text = "RUNNING" if entity.is_running else "STOPPED"
         inst_color = "green" if entity.is_installed else "yellow"
         inst_text = "YES" if entity.is_installed else "NO"
+
+        live_dir = self._get_live_storage_dir()
+        configured_dir = entity.model_dir or None
+
+        # Highlight mismatch between configured and live storage
+        if live_dir and configured_dir and live_dir != configured_dir:
+            dir_line = (
+                f"[bold]Model Dir (actual):[/bold]     [yellow]{live_dir}[/yellow]\n"
+                f"[bold]Model Dir (configured):[/bold] [cyan]{configured_dir}[/cyan]  "
+                f"[dim](not yet in effect — move models to apply)[/dim]"
+            )
+        elif configured_dir:
+            dir_line = f"[bold]Model Dir:[/bold] [cyan]{configured_dir}[/cyan]"
+        else:
+            dir_line = f"[bold]Model Dir:[/bold] [dim]{live_dir or '(default)'}[/dim]"
+
+        # Show saved default model/profile (llama.cpp only)
+        default_line = ""
+        if self._framework_name == "llama.cpp":
+            try:
+                from infrastructure.llm.model_dir_repo import ModelDirRepo
+                saved = ModelDirRepo().get_default("llama.cpp")
+                if saved:
+                    default_line = (
+                        f"[bold]Default:[/bold] [cyan]{saved.get('model', '?')}[/cyan]"
+                        f" / [green]{saved.get('profile', '?')}[/green]"
+                    )
+                else:
+                    default_line = "[bold]Default:[/bold] [dim](not set)[/dim]"
+            except Exception:
+                default_line = ""
+
         lines = [
             f"[bold]Framework:[/bold] {entity.name}",
             f"[bold]Status:[/bold] [{status_color}]{status_text}[/{status_color}]",
@@ -629,13 +860,31 @@ class FrameworkDetailScreen(Screen):
             f"[bold]Port:[/bold] {entity.port}",
             f"[bold]Active Model:[/bold] {entity.active_model or 'None'}",
             f"[bold]Models:[/bold] {len(entity.available_models)}",
+            dir_line,
         ]
+        if default_line:
+            lines.append(default_line)
         info.update("\n".join(lines))
 
         table = self.query_one("#models-table", DataTable)
         table.clear()
+        try:
+            from infrastructure.llm.model_run_config_repo import ModelRunConfigRepo
+            run_repo = ModelRunConfigRepo()
+            all_run_cfgs = run_repo.load_all()
+        except Exception:
+            all_run_cfgs = {}
         for model in entity.available_models:
-            table.add_row(model.name, _fmt_bytes(model.size_bytes), model.framework or "")
+            run_cfg = all_run_cfgs.get(model.name)
+            if run_cfg and run_cfg.profiles:
+                default = run_cfg.default_profile
+                n = len(run_cfg.profiles)
+                profile_label = f"[green]{default}[/green] ({n})"
+            else:
+                profile_label = "[dim]none[/dim]"
+            table.add_row(
+                model.name, _fmt_bytes(model.size_bytes), model.framework or "", profile_label
+            )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
@@ -643,12 +892,30 @@ class FrameworkDetailScreen(Screen):
             self.action_pull_model()
         elif bid == "btn_delete":
             self.action_delete_model()
+        elif bid == "btn_run_profile":
+            self.action_edit_run_profile()
+        elif bid == "btn_openclaw":
+            self.action_add_to_openclaw()
+        elif bid == "btn_remove_openclaw":
+            self.action_remove_from_openclaw()
         elif bid == "btn_port":
             self.action_change_port()
+        elif bid == "btn_model_dir":
+            self.action_set_model_dir()
+        elif bid == "btn_set_default":
+            self.action_set_default()
         elif bid == "btn_fw_back":
             self.app.pop_screen()
 
+    def _guard_busy(self) -> bool:
+        if self._busy:
+            self.notify("Please wait — operation in progress", severity="warning")
+            return True
+        return False
+
     def action_pull_model(self) -> None:
+        if self._guard_busy():
+            return
         self._input_mode = "pull"
         inp = self.query_one("#fw-input", Input)
         inp.placeholder = "Model name to pull (e.g. llama3:8b)"
@@ -656,32 +923,291 @@ class FrameworkDetailScreen(Screen):
         inp.focus()
 
     def action_delete_model(self) -> None:
+        if self._guard_busy():
+            return
         entity = self._hub.get(self._framework_name) if self._hub else None
         if entity and entity.available_models:
             table = self.query_one("#models-table", DataTable)
             cursor_row = table.cursor_row
             if 0 <= cursor_row < len(entity.available_models):
-                model_name = entity.available_models[cursor_row].name
-                self._do_delete(model_name)
+                self._do_delete(entity.available_models[cursor_row].name)
 
     def action_change_port(self) -> None:
+        if self._guard_busy():
+            return
         self._input_mode = "port"
         inp = self.query_one("#fw-input", Input)
         inp.placeholder = "New port number"
         inp.remove_class("hidden")
         inp.focus()
 
+    def action_set_model_dir(self) -> None:
+        if self._guard_busy():
+            return
+        self._input_mode = "model_dir"
+        live_dir = self._get_live_storage_dir()
+        inp = self.query_one("#fw-input", Input)
+        inp.placeholder = f"New model directory path (current: {live_dir or 'unknown'})"
+        inp.remove_class("hidden")
+        inp.focus()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        entity = self._hub.get(self._framework_name) if self._hub else None
+        if entity is None:
+            return
+        row = event.cursor_row
+        if 0 <= row < len(entity.available_models):
+            model = entity.available_models[row]
+            self.app.push_screen(
+                ModelRunProfileScreen(model.name, model_path=model.full_path, hub=self._hub)
+            )
+
+    def action_edit_run_profile(self) -> None:
+        """Open run profile manager for the selected model (keyboard shortcut)."""
+        entity = self._hub.get(self._framework_name) if self._hub else None
+        if entity is None:
+            return
+        table = self.query_one("#models-table", DataTable)
+        row = table.cursor_row
+        if 0 <= row < len(entity.available_models):
+            model = entity.available_models[row]
+            self.app.push_screen(
+                ModelRunProfileScreen(model.name, model_path=model.full_path, hub=self._hub)
+            )
+        else:
+            self.notify("Select a model first", severity="warning")
+
+    def action_add_to_openclaw(self) -> None:
+        """Register the selected model into openclaw agents.defaults.models."""
+        entity = self._hub.get(self._framework_name) if self._hub else None
+        if entity is None:
+            return
+        table = self.query_one("#models-table", DataTable)
+        row = table.cursor_row
+        if not (0 <= row < len(entity.available_models)):
+            self.notify("Select a model first", severity="warning")
+            return
+
+        model = entity.available_models[row]
+
+        # Build the openclaw model key using the actual provider ID from openclaw.json
+        if self._framework_name == "llama.cpp":
+            try:
+                from infrastructure.openclaw.config_repo import OpenClawConfigRepo as _OCR
+                provider_id = _OCR().get_llamacpp_provider_id() or "llamaLocal"
+            except Exception:
+                provider_id = "llamaLocal"
+            model_key = f"{provider_id}/{model.name}"  # keep .gguf
+        elif self._framework_name == "ollama":
+            model_key = f"ollama/{model.name}"
+        else:
+            model_key = f"{self._framework_name}/{model.name}"
+
+        # Look up the default profile for this model (llama.cpp only)
+        params: dict = {}
+        if self._framework_name == "llama.cpp":
+            try:
+                from infrastructure.llm.model_run_config_repo import ModelRunConfigRepo
+                run_repo = ModelRunConfigRepo()
+                cfg = run_repo.get(model.name)
+                default = cfg.get_default() if cfg else None
+                if default:
+                    params = _profile_to_openclaw_params(default)
+            except Exception:
+                pass
+
+        try:
+            from infrastructure.openclaw.config_repo import OpenClawConfigRepo
+            repo = OpenClawConfigRepo()
+
+            # Check for duplicate
+            raw = repo._read_raw()
+            provider_models = (
+                raw.get("models", {}).get("providers", {})
+                .get(provider_id, {}).get("models", [])
+            )
+            already_in_provider = any(m.get("id") == model.name for m in provider_models)
+            already_in_defaults = model_key in raw.get("agents", {}).get("defaults", {}).get("models", {})
+            if already_in_provider or already_in_defaults:
+                self.notify(
+                    f"'{model.name}' is already registered in openclaw.",
+                    severity="warning",
+                )
+                return
+
+            # 1. Register in models.providers (llama.cpp only; ollama managed by server)
+            if self._framework_name == "llama.cpp":
+                context_window = 131072 if "35B" in model.name else 65536 if "27B" in model.name else 32768
+                max_tokens = min(context_window, 32768)
+                model_entry = {
+                    "id": model.name,
+                    "name": model.name.replace(".gguf", "").replace("-", " ").replace("_", " ") + " (llama.cpp)",
+                    "api": "openai-completions",
+                    "reasoning": False,
+                    "input": ["text"],
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "contextWindow": context_window,
+                    "maxTokens": max_tokens,
+                }
+                repo.add_model_to_provider(provider_id, model_entry)
+            # 2. Register in agents.defaults.models (always; params may be empty)
+            repo.add_model_to_defaults(model_key, params)
+            profile_note = " (with profile params)" if params else ""
+            self.notify(
+                f"Added '{model_key}' to openclaw{profile_note}. "
+                "Restart openclaw to apply.",
+                severity="information",
+            )
+        except Exception as e:
+            self.notify(f"Error: {e}", severity="error")
+
+    def action_remove_from_openclaw(self) -> None:
+        """Remove the selected model from openclaw providers and agents.defaults.models."""
+        entity = self._hub.get(self._framework_name) if self._hub else None
+        if entity is None:
+            return
+        table = self.query_one("#models-table", DataTable)
+        row = table.cursor_row
+        if not (0 <= row < len(entity.available_models)):
+            self.notify("Select a model first", severity="warning")
+            return
+
+        model = entity.available_models[row]
+
+        if self._framework_name == "llama.cpp":
+            try:
+                from infrastructure.openclaw.config_repo import OpenClawConfigRepo as _OCR
+                provider_id = _OCR().get_llamacpp_provider_id() or "llamaLocal"
+            except Exception:
+                provider_id = "llamaLocal"
+        elif self._framework_name == "ollama":
+            provider_id = "ollama"
+        else:
+            provider_id = self._framework_name
+
+        try:
+            from infrastructure.openclaw.config_repo import OpenClawConfigRepo
+            repo = OpenClawConfigRepo()
+            removed = repo.remove_model_from_provider(provider_id, model.name)
+            if removed:
+                self.notify(
+                    f"Removed '{model.name}' from openclaw. Restart openclaw to apply.",
+                    severity="information",
+                )
+            else:
+                self.notify(f"'{model.name}' was not registered in openclaw.", severity="warning")
+        except Exception as e:
+            self.notify(f"Error: {e}", severity="error")
+
+    def action_set_default(self) -> None:
+        """Set the selected model + its default profile as the llama.cpp service default."""
+        if self._framework_name != "llama.cpp":
+            self.notify("Set Default only applies to llama.cpp", severity="warning")
+            return
+        if self._guard_busy():
+            return
+        entity = self._hub.get(self._framework_name) if self._hub else None
+        if entity is None:
+            return
+        table = self.query_one("#models-table", DataTable)
+        row = table.cursor_row
+        if not (0 <= row < len(entity.available_models)):
+            self.notify("Select a model first", severity="warning")
+            return
+
+        model = entity.available_models[row]
+
+        try:
+            from infrastructure.llm.model_run_config_repo import ModelRunConfigRepo
+            run_repo = ModelRunConfigRepo()
+            cfg = run_repo.get(model.name)
+            if not cfg or not cfg.profiles:
+                self.notify(
+                    "No profiles configured for this model. Add a profile first.",
+                    severity="warning",
+                )
+                return
+            profile_name = cfg.default_profile
+            profile = cfg.profiles.get(profile_name)
+            if profile is None:
+                profile_name = next(iter(cfg.profiles))
+                profile = cfg.profiles[profile_name]
+            extra_args = cfg.extra_args or []
+        except Exception as e:
+            self.notify(f"Error reading profile: {e}", severity="error")
+            return
+
+        model_dir = self._hub.get_live_storage_dir(self._framework_name) if self._hub else None
+        if model_dir:
+            model_path = str(Path(model_dir) / model.name)
+        else:
+            model_path = model.full_path or model.name
+
+        self._busy = True
+        progress = self.query_one("#fw-progress", Static)
+        progress.update(f"[yellow]Updating service: {model.name} / {profile_name} ...[/yellow]")
+        progress.remove_class("hidden")
+
+        def _worker() -> None:
+            try:
+                from infrastructure.llm.llama_cpp import LlamaCppAdapter
+                adapter = LlamaCppAdapter()
+                adapter.update_service(model_path, profile, extra_args, entity.port)
+                from infrastructure.llm.model_dir_repo import ModelDirRepo
+                ModelDirRepo().set_default("llama.cpp", model.name, profile_name)
+                if self._hub:
+                    self._hub.refresh_all()
+                def _done() -> None:
+                    self._busy = False
+                    progress.add_class("hidden")
+                    self._refresh()
+                    self.notify(
+                        f"Default set: {model.name} / {profile_name}. Service restarted.",
+                        severity="information",
+                    )
+                self.app.call_from_thread(_done)
+            except Exception as exc:
+                def _err(e=exc) -> None:
+                    self._busy = False
+                    progress.add_class("hidden")
+                    self.notify(f"Error: {e}", severity="error")
+                self.app.call_from_thread(_err)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
         inp = self.query_one("#fw-input", Input)
-        inp.add_class("hidden")
         inp.value = ""
+        mode = self._input_mode
+
+        if mode == "move_confirm":
+            inp.add_class("hidden")
+            self._input_mode = None
+            new_dir = self._pending_model_dir
+            self._pending_model_dir = None
+            if not new_dir:
+                return
+            move = value.lower() in ("y", "yes")
+            self._start_move_thread(new_dir, move_existing=move)
+            return
+
+        if mode == "purge_confirm":
+            inp.add_class("hidden")
+            self._input_mode = None
+            old_dir = self._pending_purge_dir
+            self._pending_purge_dir = None
+            if old_dir and value.lower() in ("y", "yes"):
+                self._do_purge(old_dir)
+            return
+
+        inp.add_class("hidden")
 
         if not value:
             self._input_mode = None
+            self._pending_model_dir = None
             return
 
-        mode = self._input_mode
         self._input_mode = None
 
         if mode == "pull":
@@ -696,6 +1222,20 @@ class FrameworkDetailScreen(Screen):
                     self._refresh()
             except ValueError:
                 self.notify("Invalid port number", severity="error")
+        elif mode == "model_dir":
+            # Check if there are models at the live storage location to move
+            live_dir = self._get_live_storage_dir()
+            entity = self._hub.get(self._framework_name) if self._hub else None
+            has_models = entity and len(entity.available_models) > 0
+            if has_models and live_dir and live_dir != value:
+                self._pending_model_dir = value
+                self._input_mode = "move_confirm"
+                n = len(entity.available_models)
+                inp.placeholder = f"Move {n} model(s) from {live_dir} to new dir? (y/n)"
+                inp.remove_class("hidden")
+                inp.focus()
+            else:
+                self._start_move_thread(value, move_existing=False)
 
     def _do_pull(self, name: str) -> None:
         try:
@@ -715,18 +1255,102 @@ class FrameworkDetailScreen(Screen):
 
     def _do_delete(self, name: str) -> None:
         try:
-            if self._framework_name == "ollama":
-                from infrastructure.llm.ollama import OllamaAdapter
-                adapter = OllamaAdapter()
-                adapter.delete_model(name)
-                if self._hub:
-                    self._hub.refresh_all()
-                self._refresh()
-                self.notify(f"Deleted {name}", severity="information")
-            else:
-                self.notify("Delete not supported for this framework", severity="warning")
+            if self._hub:
+                self._hub.delete_model(self._framework_name, name)
+            self._refresh()
+            self.notify(f"Deleted {name}", severity="information")
         except Exception as e:
             self.notify(f"Error deleting model: {e}", severity="error")
+
+    def _do_purge(self, old_dir: str) -> None:
+        try:
+            count = self._hub.purge_dir(self._framework_name, old_dir) if self._hub else 0
+            self.notify(f"Purged {count} item(s) from {old_dir}", severity="information")
+            self._refresh()
+        except Exception as e:
+            self.notify(f"Error purging: {e}", severity="error")
+
+    # ------------------------------------------------------------------
+    # Background move with live progress
+    # ------------------------------------------------------------------
+
+    def _start_move_thread(self, new_dir: str, move_existing: bool) -> None:
+        """Launch model dir change in a background thread."""
+        # Capture old live dir before the move (for cleanup offer)
+        old_live_dir = self._get_live_storage_dir() if move_existing else None
+
+        self._busy = True
+        progress = self.query_one("#fw-progress", Static)
+        progress.remove_class("hidden")
+        progress.update("[yellow]Starting ...[/yellow]")
+
+        def progress_cb(msg: str) -> None:
+            self.app.call_from_thread(
+                self.query_one("#fw-progress", Static).update,
+                f"[yellow]{msg}[/yellow]",
+            )
+
+        def worker() -> None:
+            error: str | None = None
+            try:
+                if self._hub:
+                    self._hub.set_model_dir(
+                        self._framework_name,
+                        new_dir,
+                        move_existing=move_existing,
+                        progress_cb=progress_cb,
+                    )
+            except Exception as exc:
+                error = str(exc)
+            self.app.call_from_thread(
+                self._on_move_done, new_dir, move_existing, old_live_dir, error
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_move_done(
+        self,
+        new_dir: str,
+        moved: bool,
+        old_live_dir: str | None,
+        error: str | None,
+    ) -> None:
+        """Called on the main thread when the background move finishes."""
+        self._busy = False
+        progress = self.query_one("#fw-progress", Static)
+
+        if error:
+            progress.update(f"[red]Error: {error}[/red]")
+            self.notify(f"Error: {error}", severity="error")
+            self._refresh()
+            return
+
+        progress.add_class("hidden")
+        action = "Moved" if moved else "Set"
+        self.notify(f"{action} model dir → {new_dir}", severity="information")
+        self._refresh()
+
+        # After a successful move, check if old location still has leftover files
+        # (can happen if the old dir is different from the new and wasn't auto-deleted)
+        if moved and old_live_dir and old_live_dir != new_dir:
+            from pathlib import Path as _Path
+            old_path = _Path(old_live_dir)
+            leftover = False
+            if self._framework_name == "llama.cpp":
+                leftover = bool(list(old_path.glob("**/*.gguf"))) if old_path.exists() else False
+            elif self._framework_name == "ollama":
+                leftover = (
+                    (old_path / "blobs").exists()
+                    and any((old_path / "blobs").iterdir())
+                ) if old_path.exists() else False
+
+            if leftover:
+                self._pending_purge_dir = old_live_dir
+                self._input_mode = "purge_confirm"
+                inp = self.query_one("#fw-input", Input)
+                inp.placeholder = f"Old files still at {old_live_dir} — delete? (y/n)"
+                inp.remove_class("hidden")
+                inp.focus()
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -765,12 +1389,26 @@ class LlmScreen(Screen):
         table.cursor_type = "row"
         table.add_columns("Name", "Installed", "Running", "Port", "Active Model", "Models")
         self._hub = _load_llm_data()
+        # Seed prev_running with current state so first live_refresh
+        # only detects changes that happen AFTER the TUI starts.
+        if self._hub is not None:
+            self._hub._prev_running = {
+                name: entity.is_running
+                for name, entity in self._hub.entities.items()
+            }
         self._refresh()
         self.set_interval(10, self._live_refresh)
 
     def _live_refresh(self) -> None:
         """Reload live data from system and update display."""
-        self._hub = _load_llm_data()
+        if self._hub is None:
+            self._hub = _load_llm_data()
+        else:
+            self._hub.refresh_all()
+        if self._hub is not None:
+            stopped = self._hub.enforce_exclusivity()
+            for name in stopped:
+                self.notify(f"Auto-stopped {name} (VRAM conflict)", severity="warning")
         self._refresh()
 
     def _refresh(self) -> None:
@@ -848,6 +1486,495 @@ class LlmScreen(Screen):
             self._hub.refresh_all()
             self._refresh()
             self.notify("Refreshed", severity="information")
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
+
+
+# ---------------------------------------------------------------------------
+# Model Run Profile Screen
+# ---------------------------------------------------------------------------
+
+_PROFILE_FIELDS = [
+    ("name",           "Profile name (e.g. daily, coding, creative)"),
+    ("context_size",   "Context window -c  (tokens, e.g. 65536)"),
+    ("max_tokens",     "Max output tokens -n  (e.g. 1024)"),
+    ("gpu_layers",     "GPU layers -ngl  (e.g. 80, or 0 for CPU)"),
+    ("temp",           "Temperature --temp  (e.g. 0.7)"),
+    ("top_p",          "Top-p --top-p  (e.g. 0.95)"),
+    ("top_k",          "Top-k --top-k  (e.g. 40, or 0 to disable)"),
+    ("min_p",          "Min-p --min-p  (e.g. 0.05, or 0 to disable)"),
+    ("repeat_penalty", "Repeat penalty --repeat-penalty  (e.g. 1.05)"),
+]
+
+
+class ModelRunProfileScreen(Screen):
+    """Manage run profiles for a single model."""
+
+    BINDINGS = [
+        Binding("n", "new_profile", "New"),
+        Binding("e", "edit_profile", "Edit"),
+        Binding("d", "delete_profile", "Delete"),
+        Binding("s", "set_profile", "Set Profile"),
+        Binding("t", "test_profile", "Test"),
+        Binding("k", "stop_test", "Stop Test"),
+        Binding("x", "edit_extra_args", "Extra Args"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def __init__(self, model_name: str, model_path: str | None = None, hub=None) -> None:
+        super().__init__()
+        self._model_name = model_name
+        self._model_path = model_path   # full path on disk (None = test unavailable)
+        self._hub = hub                 # LlmFrameworkHub, for server stop/restart
+        from infrastructure.llm.model_run_config_repo import ModelRunConfigRepo
+        self._repo = ModelRunConfigRepo()
+        self._input_step: int = 0           # current field index in _PROFILE_FIELDS
+        self._input_values: dict[str, str] = {}
+        self._editing_profile: str | None = None  # None = new; str = editing existing
+        self._active = False  # True when sequential profile input is running
+        self._editing_extra_args = False  # True when extra_args input is active
+        self._busy = False    # True when test is running
+        self._test_proc = None   # live subprocess handle for kill support
+        self._progress_lines: list[str] = []  # accumulated progress log
+        self._saved_server_cmd: list[str] | None = None  # llama-server cmd before test
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Footer()
+        with Vertical(id="profile-layout"):
+            yield Static(
+                f"[bold cyan]Run Profiles — {self._model_name}[/bold cyan]",
+                classes="panel-title",
+            )
+            yield Static("", id="profile-detail", classes="panel")
+            yield Static("", id="extra-args-display", classes="panel")
+            yield Static("", id="profile-test-result", classes="hidden")
+            yield Static("[bold]Profiles[/bold]", classes="section-title")
+            yield DataTable(id="profiles-table")
+            yield Input(placeholder="", id="profile-input", classes="hidden")
+        with Horizontal(id="profile-actions", classes="actions-bar"):
+            yield Button("New (n)", id="btn_p_new", variant="success")
+            yield Button("Edit (e)", id="btn_p_edit", variant="primary")
+            yield Button("Delete (d)", id="btn_p_delete", variant="error")
+            yield Button("Set Profile (s)", id="btn_p_default", variant="warning")
+            yield Button("Test (t)", id="btn_p_test", variant="primary")
+            yield Button("Stop Test (k)", id="btn_p_stop_test", variant="error")
+            yield Button("Extra Args (x)", id="btn_p_extra", variant="warning")
+            yield Button("Back (q)", id="btn_p_back", variant="default")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#profiles-table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns(
+            "Profile", "Context (-c)", "Max Tokens (-n)",
+            "GPU Layers (-ngl)", "Temp", "Top-p", "Top-k", "Min-p", "Repeat Penalty", "Default",
+        )
+        self._refresh()
+
+    def _refresh(self) -> None:
+        cfg = self._repo.get(self._model_name)
+        table = self.query_one("#profiles-table", DataTable)
+        table.clear()
+        # Extra args display
+        extra_display = self.query_one("#extra-args-display", Static)
+        if cfg and cfg.extra_args:
+            flags = " ".join(cfg.extra_args)
+            extra_display.update(f"[bold]Extra flags:[/bold] [yellow]{flags}[/yellow]  [dim](x to edit)[/dim]")
+        else:
+            extra_display.update("[dim]No extra flags  (x to set, e.g. --jinja)[/dim]")
+        if cfg is None or not cfg.profiles:
+            self.query_one("#profile-detail", Static).update(
+                "[dim]No profiles yet — press [n] to create one.[/dim]"
+            )
+            return
+        for pname, p in cfg.profiles.items():
+            marker = "[green]★[/green]" if pname == cfg.default_profile else ""
+            table.add_row(
+                pname,
+                str(p.context_size),
+                str(p.max_tokens),
+                str(p.gpu_layers),
+                str(p.temp),
+                str(p.top_p),
+                str(p.top_k),
+                str(p.min_p),
+                str(p.repeat_penalty),
+                marker,
+            )
+        # Show args for selected / default profile
+        default = cfg.get_default()
+        if default:
+            args = " ".join(default.to_args())
+            self.query_one("#profile-detail", Static).update(
+                f"[bold]Default profile args:[/bold]\n[dim]{args}[/dim]"
+            )
+
+    def _get_selected_profile_name(self) -> str | None:
+        table = self.query_one("#profiles-table", DataTable)
+        cfg = self._repo.get(self._model_name)
+        if cfg is None:
+            return None
+        names = list(cfg.profiles.keys())
+        row = table.cursor_row
+        if 0 <= row < len(names):
+            return names[row]
+        return None
+
+    def _start_input_sequence(self, editing_profile: str | None) -> None:
+        """Begin sequential prompting for all profile fields."""
+        self._editing_profile = editing_profile
+        self._input_values = {}
+        self._input_step = 0
+        self._active = True
+        # Pre-fill defaults from existing profile if editing
+        existing: dict[str, str] = {}
+        if editing_profile:
+            cfg = self._repo.get(self._model_name)
+            if cfg:
+                p = cfg.profiles.get(editing_profile)
+                if p:
+                    existing = {
+                        "name": p.name,
+                        "context_size": str(p.context_size),
+                        "max_tokens": str(p.max_tokens),
+                        "gpu_layers": str(p.gpu_layers),
+                        "temp": str(p.temp),
+                        "top_p": str(p.top_p),
+                        "top_k": str(p.top_k),
+                        "min_p": str(p.min_p),
+                        "repeat_penalty": str(p.repeat_penalty),
+                    }
+        self._existing_defaults = existing
+        self._prompt_step()
+
+    def _prompt_step(self) -> None:
+        field, hint = _PROFILE_FIELDS[self._input_step]
+        inp = self.query_one("#profile-input", Input)
+        default_val = self._existing_defaults.get(field, "")
+        inp.placeholder = f"{hint}  (current: {default_val})" if default_val else hint
+        inp.value = default_val
+        inp.remove_class("hidden")
+        inp.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self._editing_extra_args:
+            self._editing_extra_args = False
+            inp = self.query_one("#profile-input", Input)
+            inp.add_class("hidden")
+            raw = event.value.strip()
+            args = raw.split() if raw else []
+            self._repo.set_extra_args(self._model_name, args)
+            self.notify("Extra args saved", severity="information")
+            self._refresh()
+            return
+        if not self._active:
+            return
+        value = event.value.strip()
+        inp = self.query_one("#profile-input", Input)
+        field, _ = _PROFILE_FIELDS[self._input_step]
+        # Use existing default if user submitted empty
+        if not value and self._editing_profile:
+            value = self._existing_defaults.get(field, "")
+        if not value:
+            self.notify(f"'{field}' is required", severity="warning")
+            self._prompt_step()
+            return
+        self._input_values[field] = value
+        self._input_step += 1
+        inp.value = ""
+        if self._input_step < len(_PROFILE_FIELDS):
+            self._prompt_step()
+        else:
+            inp.add_class("hidden")
+            self._active = False
+            self._save_profile()
+
+    def _maybe_restart_service(self, profile_name: str) -> None:
+        """If this model is the current llama.cpp service default, restart it with profile_name."""
+        if not self._model_path or self._busy:
+            return
+        try:
+            from infrastructure.llm.model_dir_repo import ModelDirRepo
+            saved = ModelDirRepo().get_default("llama.cpp")
+            if not saved or saved.get("model") != self._model_name:
+                return
+        except Exception:
+            return
+        cfg = self._repo.get(self._model_name)
+        if not cfg:
+            return
+        profile = cfg.profiles.get(profile_name)
+        if not profile:
+            return
+        extra_args = cfg.extra_args or []
+        entity = self._hub.get("llama.cpp") if self._hub else None
+        port = entity.port if entity else 8080
+
+        self._busy = True
+        result_widget = self.query_one("#profile-test-result", Static)
+        result_widget.update("[yellow]Restarting llama.cpp with updated profile ...[/yellow]")
+        result_widget.remove_class("hidden")
+
+        import threading as _th
+
+        def _worker() -> None:
+            try:
+                from infrastructure.llm.llama_cpp import LlamaCppAdapter
+                LlamaCppAdapter().update_service(self._model_path, profile, extra_args, port)
+                from infrastructure.llm.model_dir_repo import ModelDirRepo
+                ModelDirRepo().set_default("llama.cpp", self._model_name, profile_name)
+                if self._hub:
+                    self._hub.refresh_all()
+                def _done() -> None:
+                    self._busy = False
+                    result_widget.add_class("hidden")
+                    self.notify(f"Service restarted with profile '{profile_name}'", severity="information")
+                self.app.call_from_thread(_done)
+            except Exception as exc:
+                def _err(e=exc) -> None:
+                    self._busy = False
+                    result_widget.add_class("hidden")
+                    self.notify(f"Restart failed: {e}", severity="error")
+                self.app.call_from_thread(_err)
+
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _save_profile(self) -> None:
+        v = self._input_values
+        try:
+            from entities.llm import ModelRunProfile
+            profile = ModelRunProfile(
+                name=v["name"],
+                context_size=int(v["context_size"]),
+                max_tokens=int(v["max_tokens"]),
+                gpu_layers=int(v["gpu_layers"]),
+                temp=float(v["temp"]),
+                top_p=float(v["top_p"]),
+                top_k=int(v["top_k"]),
+                min_p=float(v["min_p"]),
+                repeat_penalty=float(v["repeat_penalty"]),
+            )
+        except (KeyError, ValueError) as exc:
+            self.notify(f"Invalid value: {exc}", severity="error")
+            return
+        # If renaming (edit + new name != old name), delete the old profile first
+        if self._editing_profile and self._editing_profile != profile.name:
+            self._repo.delete_profile(self._model_name, self._editing_profile)
+        self._repo.upsert_profile(self._model_name, profile)
+        self.notify(f"Profile '{profile.name}' saved", severity="information")
+        self._refresh()
+        # Restart service if this profile is the current default and model is service default
+        cfg = self._repo.get(self._model_name)
+        if cfg and cfg.default_profile == profile.name:
+            self._maybe_restart_service(profile.name)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "btn_p_new":
+            self.action_new_profile()
+        elif bid == "btn_p_edit":
+            self.action_edit_profile()
+        elif bid == "btn_p_delete":
+            self.action_delete_profile()
+        elif bid == "btn_p_default":
+            self.action_set_profile()
+        elif bid == "btn_p_test":
+            self.action_test_profile()
+        elif bid == "btn_p_stop_test":
+            self.action_stop_test()
+        elif bid == "btn_p_extra":
+            self.action_edit_extra_args()
+        elif bid == "btn_p_back":
+            self.app.pop_screen()
+
+    def action_edit_extra_args(self) -> None:
+        if self._active:
+            self.notify("Finish profile input first", severity="warning")
+            return
+        cfg = self._repo.get(self._model_name)
+        current = " ".join(cfg.extra_args) if cfg and cfg.extra_args else ""
+        inp = self.query_one("#profile-input", Input)
+        inp.placeholder = "Space-separated flags, e.g: --jinja --no-context-shift  (empty = clear)"
+        inp.value = current
+        inp.remove_class("hidden")
+        inp.focus()
+        self._editing_extra_args = True
+
+    def action_new_profile(self) -> None:
+        self._existing_defaults = {}
+        self._start_input_sequence(editing_profile=None)
+
+    def action_edit_profile(self) -> None:
+        name = self._get_selected_profile_name()
+        if not name:
+            self.notify("Select a profile first", severity="warning")
+            return
+        self._start_input_sequence(editing_profile=name)
+
+    def action_delete_profile(self) -> None:
+        name = self._get_selected_profile_name()
+        if not name:
+            self.notify("Select a profile first", severity="warning")
+            return
+        self._repo.delete_profile(self._model_name, name)
+        self.notify(f"Deleted profile '{name}'", severity="information")
+        self._refresh()
+
+    def action_set_profile(self) -> None:
+        name = self._get_selected_profile_name()
+        if not name:
+            self.notify("Select a profile first", severity="warning")
+            return
+        self._repo.set_default_profile(self._model_name, name)
+        self.notify(f"Active profile set to '{name}'", severity="information")
+        self._refresh()
+        self._maybe_restart_service(name)
+
+    def action_test_profile(self) -> None:
+        if self._busy:
+            self.notify("Test already running — press k to stop it first", severity="warning")
+            return
+        if not self._model_path:
+            self.notify("No model path available (ollama models cannot be tested this way)", severity="warning")
+            return
+        profile_name = self._get_selected_profile_name()
+        if not profile_name:
+            self.notify("Select a profile to test", severity="warning")
+            return
+        cfg = self._repo.get(self._model_name)
+        if not cfg:
+            return
+        profile = cfg.profiles.get(profile_name)
+        if not profile:
+            return
+
+        self._busy = True
+        self._test_proc = None
+        self._progress_lines = []
+        self._saved_server_cmd = None
+        result_box = self.query_one("#profile-test-result", Static)
+        result_box.remove_class("hidden")
+        result_box.update("[yellow]Preparing test ... [dim](k = stop)[/dim][/yellow]")
+
+        def progress_cb(msg: str) -> None:
+            from rich.markup import escape
+
+            def _update() -> None:
+                self._progress_lines.append(escape(msg))
+                visible = self._progress_lines[-12:]  # keep last 12 lines
+                body = "\n".join(f"[yellow]{l}[/yellow]" for l in visible)
+                self.query_one("#profile-test-result", Static).update(
+                    body + "\n[dim](k = stop)[/dim]"
+                )
+
+            self.app.call_from_thread(_update)
+
+        def on_proc(proc) -> None:
+            self._test_proc = proc
+
+        model_path = self._model_path
+        hub = self._hub
+
+        def worker() -> None:
+            from infrastructure.llm.llama_cpp import test_profile_load, get_running_llamaserver_cmd
+            import time as _time
+
+            # Check if llama.cpp is running so we know whether to restart it after test
+            saved_cmd = bool(get_running_llamaserver_cmd())
+
+            # Stop ollama and llama.cpp servers before the test
+            if hub:
+                for fw_name, entity in list(hub.entities.items()):
+                    if entity.is_running:
+                        progress_cb(f"Stopping {fw_name} server ...")
+                        try:
+                            hub.stop(fw_name)
+                            hub.refresh_all()
+                        except Exception:
+                            pass
+                _time.sleep(1)
+
+            success, message = test_profile_load(
+                model_path, profile, progress_cb=progress_cb, on_proc=on_proc
+            )
+
+            # Restart llama.cpp server via systemctl (single managed instance)
+            if saved_cmd:
+                progress_cb("Restarting llama.cpp server ...")
+                try:
+                    subprocess.run(
+                        ["systemctl", "start", "llama-cpp.service"],
+                        capture_output=True, check=False,
+                    )
+                    _time.sleep(2)
+                    if hub:
+                        hub.refresh_all()
+                except Exception as exc:
+                    progress_cb(f"Warning: could not restart server: {exc}")
+            elif hub:
+                # Fallback: start via hub (may use wrong port if not persisted)
+                progress_cb("Restarting llama.cpp via hub ...")
+                try:
+                    hub.start("llama.cpp")
+                    hub.refresh_all()
+                except Exception:
+                    pass
+
+            self.app.call_from_thread(self._on_test_done, success, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def action_stop_test(self) -> None:
+        if not self._busy:
+            self.notify("No test is running", severity="warning")
+            return
+        proc = self._test_proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._test_proc = None
+        self._busy = False
+        result_box = self.query_one("#profile-test-result", Static)
+        result_box.update("[yellow]Test stopped by user.[/yellow]")
+        self.notify("Test stopped", severity="warning")
+
+    def _on_test_done(self, success: bool, message: str) -> None:
+        # Guard: if user already stopped the test, ignore late callback
+        if not self._busy:
+            return
+        self._busy = False
+        self._test_proc = None
+        result_box = self.query_one("#profile-test-result", Static)
+
+        # Build log tail from accumulated progress lines
+        from rich.markup import escape
+        log_tail = "\n".join(
+            f"[dim]{l}[/dim]" for l in self._progress_lines[-8:]
+        )
+        sep = "\n─────\n" if log_tail else ""
+
+        if not success:
+            result_box.update(
+                f"{log_tail}{sep}[red]FAIL — model could not load (OOM)[/red]\n[dim]{escape(message)}[/dim]"
+            )
+            self.notify("Test FAILED — model could not load", severity="error")
+        elif message.startswith("WARN"):
+            result_box.update(
+                f"{log_tail}{sep}[yellow]WARN — loaded with OOM warnings[/yellow]\n[dim]{escape(message)}[/dim]"
+            )
+            self.notify("OOM warnings detected — try reducing -c or -ngl", severity="warning")
+        elif message.startswith("CLEAN"):
+            result_box.update(
+                f"{log_tail}{sep}[green]CLEAN — no OOM[/green]\n[dim]{escape(message)}[/dim]"
+            )
+            self.notify("Profile is clean — no OOM warnings", severity="information")
+        else:
+            # Timeout or other non-OOM result
+            result_box.update(f"{log_tail}{sep}[yellow]{escape(message)}[/yellow]")
+            self.notify(message[:80], severity="warning")
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -1133,6 +2260,11 @@ class ClawCtrlApp(App):
     .actions-bar Button {
         margin: 0 1;
         min-width: 12;
+    }
+
+    #fw-actions Button {
+        margin: 0 1;
+        min-width: 10;
     }
 
     #openclaw-layout {
